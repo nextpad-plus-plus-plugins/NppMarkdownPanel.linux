@@ -1,0 +1,6 @@
+build/
+build-release/
+*.o
+*.so
+*.zip
+.DS_Store
