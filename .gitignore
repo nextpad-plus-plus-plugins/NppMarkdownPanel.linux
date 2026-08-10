@@ -4,3 +4,4 @@ build-release/
 *.so
 *.zip
 .DS_Store
+dist/
