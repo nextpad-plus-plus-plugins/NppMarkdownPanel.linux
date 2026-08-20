@@ -53,6 +53,7 @@ struct MarkdownSettings {
     bool enableMermaid = false;
     bool enableSquared = false;              // render mermaid flowcharts in the "squared" style
     std::string squaredTheme = "boardroom";  // boardroom | linen | blueprint
+    bool syncPreviewToEditor = false;        // reverse sync: scrolling the preview scrolls the editor
 };
 
 static MarkdownSettings sSettings;
@@ -81,6 +82,15 @@ static std::string sFullTemplate;
 static guint sPendingRender = 0;    // g_timeout source ids (0 = none)
 static guint sPendingScroll = 0;
 
+// Image cache-buster generation. WebKit's WebContent process serves file://
+// <img> subresources from an in-process memory cache keyed by URL, so an
+// image edited on disk keeps rendering stale until its URL changes. Every
+// render passes this generation to the page (window._imgGen) and the JS
+// appends ?v=<gen> to local img URLs. Bumped on template (re)loads — which
+// covers the Refresh button — and when the application becomes active again
+// (the "edited the image in another app, switched back" case).
+static long sImageGeneration = 0;
+
 // Forward declarations
 static void togglePanel();
 static void syncWithCaretCmd();
@@ -92,6 +102,10 @@ static void exportCurrentToHtmlCmd();
 static void exportCurrentToPdfCmd();
 static void renderMarkdownDirect();
 static void renderMarkdownDeferred();
+// Preview → editor bridge (script-message callbacks)
+static void applyPreviewScrollToEditor(intptr_t docLine);
+static void locateWordFromPreview(const char *word, intptr_t startLine,
+                                  intptr_t endLine, intptr_t occ);
 static void ensureContentView();
 static void refreshMarkdownPreview();
 static void saveMarkdownAsPDF();
@@ -398,6 +412,18 @@ function renderMarkdown(md) {
 
   document.getElementById('content').innerHTML = html;
 
+  // Cache-bust local images: append ?v=<gen> so an image edited on disk gets
+  // a fresh cache key (native bumps window._imgGen; the file loader ignores
+  // the query). Remote and data: URLs untouched; gen 0 keeps pristine URLs.
+  var _gen = window._imgGen || 0;
+  if (_gen > 0) {
+    document.querySelectorAll('#content img').forEach(function(img) {
+      var src = img.getAttribute('src') || '';
+      if (!src || /^(https?|data):/i.test(src)) return;
+      img.setAttribute('src', src + (src.indexOf('?') >= 0 ? '&' : '?') + 'v=' + _gen);
+    });
+  }
+
   var newBlockMap = _buildBlockMap(md, content);
   var actualBlockCount = document.querySelectorAll('[id^="block-"]').length;
   if (newBlockMap.length === actualBlockCount && actualBlockCount > 0) {
@@ -617,6 +643,13 @@ function scrollToLine(lineNo) {
       var ratio = Math.max(0, Math.min(1, lineNo / (window._totalLines - 1)));
       targetY = Math.round(ratio * maxScroll);
     }
+    // Mask this programmatic scroll from the reverse-sync reporter: smooth
+    // scrolling emits a stream of scroll events until it settles, and none
+    // of them may be echoed back to the editor (feedback-loop guard #2).
+    if (Math.abs(window.scrollY - targetY) > 2) {
+      window._progTargetY = targetY;
+      window._progTargetTs = Date.now();
+    }
     window.scrollTo({ top: targetY, behavior: 'smooth' });
     _scrollTimer = null;
   }, 50);
@@ -625,6 +658,123 @@ function scrollToLine(lineNo) {
 function scrollToTop() {
   window.scrollTo({top: 0, behavior: 'smooth'});
 }
+
+// ───────────────── Preview → editor bridge ─────────────────
+// Posts { type:'scroll', line } while the USER scrolls the preview, and
+// { type:'wordTap', ... } on double-click. Feedback-loop protection is
+// layered on both sides of the bridge:
+//   JS  #1: positive intent gate — nothing is reported unless real input
+//           (wheel / scrollbar mousedown / keydown) happened in the last
+//           300 ms; programmatic scrolls produce none of these.
+//   JS  #2: scrollToLine() masks its own smooth-scroll event stream via
+//           window._progTargetY until the target settles (or 700 ms).
+//   Native: applyPreviewScrollToEditor() pre-updates the forward-sync
+//           trackers and keeps a ±1-line dead-band (see the .cpp side).
+var _bridge = (window.webkit && window.webkit.messageHandlers)
+                ? window.webkit.messageHandlers.nppmd : null;
+window._progTargetY  = null;
+window._progTargetTs = 0;
+var _lastUserInputTs = 0;
+['wheel', 'mousedown', 'keydown'].forEach(function(evt) {
+  window.addEventListener(evt, function() { _lastUserInputTs = Date.now(); },
+                          { passive: true, capture: true });
+});
+
+// Inverse of _resolveBlockTargetY: current scroll Y → source line, using the
+// same blockMap with interpolation between block tops (proportional fallback
+// when the map is empty).
+function _lineFromScrollY(y) {
+  var bm = window._blockMap || [];
+  var maxScroll = Math.max(1,
+    document.documentElement.scrollHeight - window.innerHeight);
+  var total = (window._totalLines || 1) - 1;
+  if (!bm.length) {
+    return Math.round(Math.max(0, Math.min(1, y / maxScroll)) * total);
+  }
+  var lo = 0, hi = bm.length - 1, k = 0;
+  while (lo <= hi) {
+    var mid = (lo + hi) >> 1;
+    var el = document.getElementById(bm[mid].id);
+    var top = el ? el.offsetTop : 0;
+    if (top <= y) { k = mid; lo = mid + 1; } else { hi = mid - 1; }
+  }
+  var elK = document.getElementById(bm[k].id);
+  if (!elK) return bm[k].line;
+  var topK = elK.offsetTop;
+  var line = bm[k].line;
+  if (k + 1 < bm.length) {
+    var elN = document.getElementById(bm[k + 1].id);
+    if (elN && elN.offsetTop > topK) {
+      var t = Math.max(0, Math.min(1, (y - topK) / (elN.offsetTop - topK)));
+      line = bm[k].line + t * (bm[k + 1].line - bm[k].line);
+    }
+  } else if (maxScroll > topK) {
+    var t2 = Math.max(0, Math.min(1, (y - topK) / (maxScroll - topK)));
+    line = bm[k].line + t2 * (total - bm[k].line);
+  }
+  return Math.max(0, Math.round(line));
+}
+
+var _revScrollTimer = null;
+window.addEventListener('scroll', function() {
+  if (!_bridge) return;
+  var y = window.scrollY;
+  if (window._progTargetY !== null) {          // guard #2: our own smooth scroll
+    if (Math.abs(y - window._progTargetY) <= 2 ||
+        Date.now() - window._progTargetTs > 700) {
+      window._progTargetY = null;
+    }
+    return;
+  }
+  if (Date.now() - _lastUserInputTs > 300) return;   // guard #1: no user intent
+  if (_revScrollTimer) clearTimeout(_revScrollTimer);
+  _revScrollTimer = setTimeout(function() {
+    _revScrollTimer = null;
+    _bridge.postMessage({ type: 'scroll', line: _lineFromScrollY(window.scrollY) });
+  }, 100);
+}, { passive: true });
+
+// Double-click a word in the preview → select it in the source. Always on
+// (explicit gesture, no loop potential). Best-effort by design: preview
+// text differs from source text inside link labels/emphasis, so native
+// falls back from "same occurrence" to "first occurrence in the block".
+document.addEventListener('dblclick', function() {
+  if (!_bridge) return;
+  var sel = window.getSelection();
+  if (!sel || sel.isCollapsed || sel.rangeCount === 0) return;
+  var word = sel.toString().trim();
+  if (!word || word.length > 200 || /\s/.test(word)) return;
+  var node = sel.anchorNode;
+  var el = (node && node.nodeType === 3) ? node.parentElement : node;
+  if (!el || !el.closest) return;
+  if (el.closest('svg, .mermaid')) return;      // diagrams have no text mapping
+  var block = el.closest('[id^="block-"]');
+  if (!block) return;
+  var bm = window._blockMap || [];
+  var idx = -1;
+  for (var i = 0; i < bm.length; i++) {
+    if (bm[i].id === block.id) { idx = i; break; }
+  }
+  if (idx < 0) return;
+  var startLine = bm[idx].line;
+  var endLine = (idx + 1 < bm.length)
+                  ? Math.max(startLine, bm[idx + 1].line - 1)
+                  : ((window._totalLines || startLine + 1) - 1);
+  // Count occurrences of the word in this block BEFORE the selection, so
+  // native can pick the matching occurrence in the source range.
+  var occ = 0;
+  try {
+    var r = sel.getRangeAt(0);
+    var pre = document.createRange();
+    pre.selectNodeContents(block);
+    pre.setEnd(r.startContainer, r.startOffset);
+    var esc = word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    var m = pre.toString().match(new RegExp(esc, 'g'));
+    occ = m ? m.length : 0;
+  } catch (e) { occ = 0; }
+  _bridge.postMessage({ type: 'wordTap', word: word,
+                        startLine: startLine, endLine: endLine, occ: occ });
+}, true);
 
 if (typeof mermaid !== 'undefined') {
   mermaid.initialize({startOnLoad: false, theme: 'default'});
@@ -669,6 +819,7 @@ static void loadSettings() {
         LOAD_BOOL(allowAllExtensions,       "allowAllExtensions");
         LOAD_BOOL(enableMermaid,            "enableMermaid");
         LOAD_BOOL(enableSquared,            "enableSquared");
+        LOAD_BOOL(syncPreviewToEditor,      "syncPreviewToEditor");
         #undef LOAD_BOOL
         gchar *s = g_key_file_get_string(kf, "markdown", "supportedExtensions", NULL);
         if (s) { sSettings.supportedExtensions = s; g_free(s); }
@@ -704,6 +855,7 @@ static void saveSettings() {
     g_key_file_set_boolean(kf, "markdown", "enableMermaid", sSettings.enableMermaid);
     g_key_file_set_boolean(kf, "markdown", "enableSquared", sSettings.enableSquared);
     g_key_file_set_string (kf, "markdown", "squaredTheme",  sSettings.squaredTheme.c_str());
+    g_key_file_set_boolean(kf, "markdown", "syncPreviewToEditor", sSettings.syncPreviewToEditor);
     g_key_file_save_to_file(kf, path.c_str(), NULL);
     g_key_file_free(kf);
 }
@@ -834,6 +986,122 @@ static GtkWidget *panelButton(const char *icon, const char *tooltip,
     return b;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// JS → native bridge. The template posts to window.webkit.messageHandlers.
+// nppmd (the SAME JS surface WebKitGTK exposes for a registered script-message
+// handler); the signal delivers a JSCValue on the main thread. Two message
+// types today, mirroring the macOS _NMPScriptBridge:
+//   { type:'scroll',  line }                          — reverse scroll sync
+//   { type:'wordTap', word, startLine, endLine, occ } — double-click locate
+// ─────────────────────────────────────────────────────────────────────────────
+
+static bool jscPropNumber(JSCValue *obj, const char *name, intptr_t *out) {
+    JSCValue *v = jsc_value_object_get_property(obj, name);
+    bool ok = v && jsc_value_is_number(v);
+    if (ok) *out = (intptr_t)jsc_value_to_double(v);
+    if (v) g_object_unref(v);
+    return ok;
+}
+
+static void on_script_message(WebKitUserContentManager *, JSCValue *value, gpointer) {
+    if (!value || !jsc_value_is_object(value)) return;
+    JSCValue *tv = jsc_value_object_get_property(value, "type");
+    gchar *type = (tv && jsc_value_is_string(tv)) ? jsc_value_to_string(tv) : NULL;
+    if (tv) g_object_unref(tv);
+    if (!type) return;
+
+    if (g_strcmp0(type, "scroll") == 0) {
+        intptr_t line = 0;
+        if (jscPropNumber(value, "line", &line))
+            applyPreviewScrollToEditor(line);
+    } else if (g_strcmp0(type, "wordTap") == 0) {
+        intptr_t s = 0, e = 0, occ = 0;
+        JSCValue *wv = jsc_value_object_get_property(value, "word");
+        gchar *word = (wv && jsc_value_is_string(wv)) ? jsc_value_to_string(wv) : NULL;
+        if (wv) g_object_unref(wv);
+        if (word && jscPropNumber(value, "startLine", &s) &&
+                    jscPropNumber(value, "endLine", &e)) {
+            jscPropNumber(value, "occ", &occ);   // optional, defaults 0
+            locateWordFromPreview(word, s, e, occ);
+        }
+        g_free(word);
+    }
+    g_free(type);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Application re-activation — the Linux stand-in for macOS's
+// NSApplicationDidBecomeActiveNotification. "Edited the image in another app
+// and switched back" is the moment stale images are actually noticed: bump the
+// cache-buster and re-render. GTK has no app-level activation signal, so we
+// watch notify::is-active on the panel's toplevel (the host window when
+// docked, the float when detached — re-tracked on every map, since dock/float
+// reparents the panel). A window losing focus to ANOTHER of our toplevels
+// (find window, dialogs…) is NOT an app deactivation — a short probe checks
+// that no app toplevel is active before arming, so in-app window switches
+// don't trigger full re-renders (mermaid would visibly re-run).
+// ─────────────────────────────────────────────────────────────────────────────
+
+static GtkWindow *sActiveWin        = NULL;   // weak — window we listen on
+static gulong     sActiveWinHandler = 0;
+static bool       sAppWasInactive   = false;
+static guint      sAppInactiveProbe = 0;      // g_timeout source id (0 = none)
+
+static gboolean appInactiveProbeCb(gpointer) {
+    sAppInactiveProbe = 0;
+    GListModel *tops = gtk_window_get_toplevels();
+    guint n = g_list_model_get_n_items(tops);
+    bool anyActive = false;
+    for (guint i = 0; i < n && !anyActive; i++) {
+        gpointer item = g_list_model_get_item(tops, i);   // strong ref
+        if (item) {
+            anyActive = GTK_IS_WINDOW(item) && gtk_window_is_active(GTK_WINDOW(item));
+            g_object_unref(item);
+        }
+    }
+    if (!anyActive) sAppWasInactive = true;
+    return G_SOURCE_REMOVE;
+}
+
+static void on_root_active_changed(GObject *win, GParamSpec *, gpointer) {
+    if (gtk_window_is_active(GTK_WINDOW(win))) {
+        if (sAppInactiveProbe) { g_source_remove(sAppInactiveProbe); sAppInactiveProbe = 0; }
+        if (!sAppWasInactive) return;
+        sAppWasInactive = false;
+        if (!sPanelVisible || !sWebView || !sWebViewReady) return;
+        sImageGeneration++;
+        sLastRenderedText.clear();   // defeat the no-change early-out
+        renderMarkdownDeferred();
+    } else {
+        // Deactivated — but focus may just be moving to another app window.
+        // Probe shortly after, once the focus transfer has settled.
+        if (sAppInactiveProbe) g_source_remove(sAppInactiveProbe);
+        sAppInactiveProbe = g_timeout_add(60, appInactiveProbeCb, NULL);
+    }
+}
+
+// (Re)attach the is-active watcher to the panel's CURRENT toplevel. Called
+// from the panel's map handler — map fires again after every dock/float
+// reparent, so the watcher follows the panel across toplevels.
+static void panelTrackActiveWindow() {
+    GtkRoot *root = sContentBox ? gtk_widget_get_root(sContentBox) : NULL;
+    GtkWindow *win = (root && GTK_IS_WINDOW(root)) ? GTK_WINDOW(root) : NULL;
+    if (win == sActiveWin) return;
+    if (sActiveWin) {   // weak ptr — NULLed automatically if the float died
+        g_signal_handler_disconnect(sActiveWin, sActiveWinHandler);
+        g_object_remove_weak_pointer(G_OBJECT(sActiveWin), (gpointer *)&sActiveWin);
+        sActiveWin = NULL;
+        sActiveWinHandler = 0;
+    }
+    if (!win) return;
+    sActiveWin = win;
+    g_object_add_weak_pointer(G_OBJECT(win), (gpointer *)&sActiveWin);
+    sActiveWinHandler = g_signal_connect(win, "notify::is-active",
+                                         G_CALLBACK(on_root_active_changed), NULL);
+}
+
+static void on_panel_map(GtkWidget *, gpointer) { panelTrackActiveWindow(); }
+
 // Build (once) the panel content: search/buttons toolbar row + WebView.
 // Layout mirrors the macOS panel:
 //   [search field ▸ expandable] [settings] [refresh] [save-PDF] [print]
@@ -883,8 +1151,19 @@ static void ensureContentView() {
     g_signal_connect(sWebView, "load-changed",  G_CALLBACK(on_load_changed), NULL);
     g_signal_connect(sWebView, "load-failed",   G_CALLBACK(on_load_failed), NULL);
 
+    // JS → native message channel (reverse scroll sync + double-click word
+    // locate). Registered on the view's content manager BEFORE the first
+    // load, so window.webkit.messageHandlers.nppmd exists in every page.
+    WebKitUserContentManager *ucm = webkit_web_view_get_user_content_manager(sWebView);
+    webkit_user_content_manager_register_script_message_handler(ucm, "nppmd", NULL);
+    g_signal_connect(ucm, "script-message-received::nppmd",
+                     G_CALLBACK(on_script_message), NULL);
+
     gtk_widget_set_vexpand(GTK_WIDGET(sWebView), TRUE);
     gtk_box_append(GTK_BOX(sContentBox), GTK_WIDGET(sWebView));
+
+    // App re-activation watcher (image cache-buster) — see panelTrackActiveWindow.
+    g_signal_connect(sContentBox, "map", G_CALLBACK(on_panel_map), NULL);
 
     GtkEventController *keys = gtk_event_controller_key_new();
     gtk_event_controller_set_propagation_phase(keys, GTK_PHASE_CAPTURE);
@@ -902,6 +1181,11 @@ static bool markdownPanelIsShown() {
 
 static void loadTemplateIntoWebView() {
     if (!sWebView || sFullTemplate.empty()) return;
+
+    // New navigation, same WebContent process → same memory cache. Bump the
+    // image generation so this page's renders re-fetch local images (covers
+    // the Refresh button, file switches, and settings reloads).
+    sImageGeneration++;
 
     // Write the HTML into the SAME directory as the markdown file so relative
     // image paths resolve naturally (identical reasoning to the macOS build:
@@ -981,7 +1265,8 @@ static void renderMarkdownDirect() {
         return;   // on_load_changed(FINISHED) re-enters renderMarkdownDirect
     }
 
-    runJS(sWebView, "renderMarkdown(" + jsonEscape(text) + ");");
+    runJS(sWebView, "window._imgGen=" + std::to_string(sImageGeneration) +
+                    "; renderMarkdown(" + jsonEscape(text) + ");");
 }
 
 static gboolean deferredRenderCb(gpointer) {
@@ -1042,6 +1327,95 @@ static void syncScroll() {
     sPendingScrollLine = targetLine;
     if (sPendingScroll) g_source_remove(sPendingScroll);
     sPendingScroll = g_timeout_add(100, scrollFlushCb, NULL);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Reverse sync: the preview reported a user scroll → move the editor.
+// Feedback-loop guards on this side (the JS side has its own two):
+//   - dead-band: a move of ≤1 doc line is quantization noise from the
+//     pixel→line interpolation, not intent — applying it would let the two
+//     panes "correct" each other in a limit cycle;
+//   - tracker pre-update: refresh sLastCaretLine/sLastFirstVisibleLine with
+//     the values the imminent SCN_UPDATEUI will observe, so syncScroll()
+//     sees "no change" and does not echo this scroll back into the preview.
+// ─────────────────────────────────────────────────────────────────────────────
+static void applyPreviewScrollToEditor(intptr_t docLine) {
+    if (!sSettings.syncPreviewToEditor) return;
+    if (!sPanelVisible) return;
+    void *h = getCurScintilla();
+    if (!h) return;
+
+    intptr_t lineCount = sci(h, SCI_GETLINECOUNT);
+    if (lineCount <= 0) return;
+    if (docLine < 0) docLine = 0;
+    if (docLine > lineCount - 1) docLine = lineCount - 1;
+
+    intptr_t curVis = sci(h, SCI_GETFIRSTVISIBLELINE);
+    intptr_t curDoc = sci(h, SCI_DOCLINEFROMVISIBLE, (uintptr_t)curVis);
+    if (docLine >= curDoc - 1 && docLine <= curDoc + 1) return;   // dead-band
+
+    // Doc line → visible line handles word wrap and folds.
+    intptr_t vis = sci(h, SCI_VISIBLEFROMDOCLINE, (uintptr_t)docLine);
+    sci(h, SCI_SETFIRSTVISIBLELINE, (uintptr_t)vis);
+
+    // Read BACK what Scintilla actually applied (it may clamp near EOF) so
+    // the tracker matches exactly what the next SCN_UPDATEUI will report.
+    intptr_t actualVis = sci(h, SCI_GETFIRSTVISIBLELINE);
+    sLastFirstVisibleLine = sci(h, SCI_DOCLINEFROMVISIBLE, (uintptr_t)actualVis);
+    intptr_t pos = sci(h, SCI_GETCURRENTPOS);
+    sLastCaretLine = sci(h, SCI_LINEFROMPOSITION, (uintptr_t)pos);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Double-click in the preview: select `word` in the source, preferring the
+// occ-th occurrence within the block's source-line range [startLine,endLine]
+// (occ = occurrences seen before the clicked one in the preview block).
+// Preview text ≠ source text inside link labels/emphasis, so this degrades
+// deliberately: exact occurrence → last found in range → silent no-op.
+// ─────────────────────────────────────────────────────────────────────────────
+static void locateWordFromPreview(const char *word, intptr_t startLine,
+                                  intptr_t endLine, intptr_t occ) {
+    if (!sPanelVisible || !word || !*word) return;
+    void *h = getCurScintilla();
+    if (!h) return;
+
+    intptr_t lineCount = sci(h, SCI_GETLINECOUNT);
+    if (lineCount <= 0) return;
+    if (startLine < 0) startLine = 0;
+    if (startLine > lineCount - 1) startLine = lineCount - 1;
+    if (endLine < startLine) endLine = startLine;
+    if (endLine > lineCount - 1) endLine = lineCount - 1;
+
+    intptr_t needleLen = (intptr_t)strlen(word);
+
+    intptr_t rangeStart = sci(h, SCI_POSITIONFROMLINE, (uintptr_t)startLine);
+    intptr_t rangeEnd   = sci(h, SCI_GETLINEENDPOSITION, (uintptr_t)endLine);
+    if (rangeEnd <= rangeStart) return;
+
+    sci(h, SCI_SETSEARCHFLAGS, SCFIND_MATCHCASE);
+    intptr_t foundStart = -1, foundEnd = -1;
+    intptr_t searchPos = rangeStart;
+    for (intptr_t i = 0; searchPos < rangeEnd; i++) {
+        sci(h, SCI_SETTARGETSTART, (uintptr_t)searchPos);
+        sci(h, SCI_SETTARGETEND, (uintptr_t)rangeEnd);
+        intptr_t hit = sci(h, SCI_SEARCHINTARGET, (uintptr_t)needleLen, (intptr_t)word);
+        if (hit < 0) break;
+        foundStart = hit;
+        foundEnd   = sci(h, SCI_GETTARGETEND);
+        if (i == occ) break;                 // reached the matching occurrence
+        searchPos = foundEnd;
+    }
+    if (foundStart < 0) return;              // nothing in range — stay silent
+
+    sci(h, SCI_SETSEL, (uintptr_t)foundStart, (intptr_t)foundEnd);
+    sci(h, SCI_SCROLLCARET);
+
+    // The user is already looking at the right block in the preview — keep
+    // the forward sync from scrolling it again (same tracker trick as above).
+    intptr_t pos = sci(h, SCI_GETCURRENTPOS);
+    sLastCaretLine = sci(h, SCI_LINEFROMPOSITION, (uintptr_t)pos);
+    intptr_t curVis = sci(h, SCI_GETFIRSTVISIBLELINE);
+    sLastFirstVisibleLine = sci(h, SCI_DOCLINEFROMVISIBLE, (uintptr_t)curVis);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1474,7 +1848,7 @@ static struct {
     GtkWidget *win;
     GtkWidget *zoom, *exts;
     GtkWidget *chk_allext, *chk_autoshow, *chk_caret, *chk_firstline;
-    GtkWidget *chk_mermaid, *chk_squared;
+    GtkWidget *chk_mermaid, *chk_squared, *chk_syncprev;
     GtkWidget *rad_boardroom, *rad_linen, *rad_blueprint;
 } sDlg;
 
@@ -1521,6 +1895,9 @@ static void on_settings_save(GtkButton *, gpointer) {
         gtk_check_button_get_active(GTK_CHECK_BUTTON(sDlg.rad_blueprint)) ? "blueprint"
                                                                           : "boardroom";
     if (newTheme != sSettings.squaredTheme) { sSettings.squaredTheme = newTheme; needsReload = true; }
+
+    sSettings.syncPreviewToEditor =
+        gtk_check_button_get_active(GTK_CHECK_BUTTON(sDlg.chk_syncprev));
 
     npp(NPPM_SETMENUITEMCHECK, (unsigned long)funcItem[2].cmdID, sSettings.syncWithCaret ? 1 : 0);
     npp(NPPM_SETMENUITEMCHECK, (unsigned long)funcItem[3].cmdID, sSettings.syncWithFirstVisibleLine ? 1 : 0);
@@ -1638,6 +2015,11 @@ static void showSettingsCmd() {
         gtk_box_append(GTK_BOX(row), sDlg.rad_blueprint);
         gtk_box_append(GTK_BOX(vbox), row);
     }
+
+    // Reverse scroll sync — bottom of the dialog (macOS layout parity)
+    sDlg.chk_syncprev = check("Synchronize editor when scrolling preview",
+                              sSettings.syncPreviewToEditor);
+    gtk_box_append(GTK_BOX(vbox), sDlg.chk_syncprev);
 
     // Save button
     {
@@ -1844,6 +2226,7 @@ extern "C" NPP_EXPORT void beNotified(SCNotification *n) {
             }
             if (sPendingRender) { g_source_remove(sPendingRender); sPendingRender = 0; }
             if (sPendingScroll) { g_source_remove(sPendingScroll); sPendingScroll = 0; }
+            if (sAppInactiveProbe) { g_source_remove(sAppInactiveProbe); sAppInactiveProbe = 0; }
             if (g_panelHandle > 0) {
                 npp(NPPM_DMM_UNREGISTERPANEL, (unsigned long)g_panelHandle, 0);
                 g_panelHandle = 0;
