@@ -1442,6 +1442,14 @@ static void togglePanel() {
             g_warning("[MarkdownPanel] panel registration failed");
             return;
         }
+        // Declare the reopen command so the host restores the panel after a
+        // restart (GH linux#18): module = getName() ("Markdown Panel"),
+        // cmdIndex 0 = "Toggle Markdown Panel". Hosts < 1.1.0 return 0 — ignored.
+        NppPanelInfo info;
+        info.moduleName = PLUGIN_NAME;
+        info.cmdIndex   = 0;
+        npp(NPPM_DMM_SETPANELINFO, (unsigned long)(uintptr_t)g_panelHandle,
+            (long)(intptr_t)&info);
     }
 
     // Target the OPPOSITE of the live state — self-corrects when the user
